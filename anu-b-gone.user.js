@@ -1,9 +1,15 @@
 // ==UserScript==
 // @name         anu-b-gone
-// @namespace    local
-// @version      1.0
-// @description  NO MORE. ANUBIS. TY.
+// @namespace    https://github.com/tbware/anu-b-gone
+// @version      1.1
+// @description  solve anubis challenges without page js, hide the mascot
+// @license      GPL-3.0-or-later
+// @homepageURL  https://github.com/tbware/anu-b-gone
+// @supportURL   https://github.com/tbware/anu-b-gone/issues
+// @downloadURL  https://raw.githubusercontent.com/tbware/anu-b-gone/main/anu-b-gone.user.js
+// @updateURL    https://raw.githubusercontent.com/tbware/anu-b-gone/main/anu-b-gone.user.js
 // @match        *://*/*
+// @noframes
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
@@ -16,6 +22,11 @@
     const mascot_path = asset_path + "static/img/";
     const id_challenge = "anubis_challenge";
     const id_prefix = "anubis_base_prefix";
+    const id_preact = "preact_info";
+    const wasm_path = asset_path + "static/wasm/";
+    const sha256_algos = ["fast", "slow"];
+    const wasm_algos = ["argon2id", "hashx", "sha256"];
+    const preact_ms = 125;
     const hide_id = "hide-anubis";
     const reveal_ms = 5000;
     let acted = false;
@@ -146,6 +157,47 @@
         }
     }
 
+    function bytes_hex(bytes) {
+        let out = "";
+        for (let i = 0; i < bytes.length; i++) {
+            out += bytes[i].toString(16).padStart(2, "0");
+        }
+        return out;
+    }
+
+    function hex_bytes(hex) {
+        const out = new Uint8Array(hex.length / 2);
+        for (let i = 0; i < out.length; i++) {
+            out[i] = parseInt(hex.substr(i * 2, 2), 16);
+        }
+        return out;
+    }
+
+    async function wasm_fetch(url) {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(url + ": " + res.status);
+        return res.arrayBuffer();
+    }
+
+    async function wasm_solve(prefix, algorithm, data, difficulty) {
+        const base = location.origin + prefix + wasm_path;
+        let code = await wasm_fetch(base + "simd128/" + algorithm + ".wasm");
+        if (!WebAssembly.validate(code)) {
+            code = await wasm_fetch(base + "baseline/" + algorithm + ".wasm");
+        }
+        const imports = { anubis: { anubis_update_nonce: function () {} } };
+        const x = (await WebAssembly.instantiate(code, imports))
+            .instance.exports;
+        const input = hex_bytes(data);
+        new Uint8Array(x.memory.buffer, x.data_ptr(), input.length)
+            .set(input);
+        x.set_data_length(input.length);
+        const nonce = x.anubis_work(difficulty, 0, 1) >>> 0;
+        const hash = new Uint8Array(x.memory.buffer, x.result_hash_ptr(),
+            x.result_hash_size());
+        return { hash: bytes_hex(hash), nonce: nonce };
+    }
+
     function pass_url(challenge, prefix, result, elapsed_ms) {
         const url = new URL(location.origin + prefix + pass_path);
         url.searchParams.set("id", challenge.id);
@@ -153,6 +205,31 @@
         url.searchParams.set("nonce", String(result.nonce));
         url.searchParams.set("redir", location.pathname + location.search);
         url.searchParams.set("elapsedTime", String(elapsed_ms));
+        return url.toString();
+    }
+
+    async function pow_pass(challenge, rules, prefix) {
+        const algo = rules.algorithm;
+        const data = challenge.randomData;
+        const started = performance.now();
+        let result;
+        if (sha256_algos.includes(algo)) {
+            result = pow_solve(data, rules.difficulty);
+        } else {
+            result = await wasm_solve(prefix, algo, data, rules.difficulty);
+        }
+        return pass_url(challenge, prefix, result,
+            performance.now() - started);
+    }
+
+    async function preact_pass() {
+        const info = dom_json(id_preact);
+        await new Promise(function (done) {
+            setTimeout(done, info.difficulty * preact_ms);
+        });
+        const url = new URL(info.redir, location.href);
+        const data = new TextEncoder().encode(info.challenge);
+        url.searchParams.set("result", sha256_hex(data));
         return url.toString();
     }
 
@@ -164,15 +241,25 @@
         if (!challenge || !rules ||
                 typeof challenge.randomData !== "string") return false;
 
+        const algo = rules.algorithm;
+        let solve;
+        if (algo === "preact") {
+            if (!dom_json(id_preact)) return false;
+            solve = preact_pass;
+        } else if (sha256_algos.includes(algo) || wasm_algos.includes(algo)) {
+            solve = pow_pass;
+        } else {
+            return false;
+        }
+
         acted = true;
         hide();
-
-        const prefix = dom_json(id_prefix) || "";
-        const started = performance.now();
-        const result = pow_solve(challenge.randomData, rules.difficulty);
-        const elapsed = performance.now() - started;
-
-        location.replace(pass_url(challenge, prefix, result, elapsed));
+        solve(challenge, rules, dom_json(id_prefix) || "").then(
+            function (url) { location.replace(url); },
+            function (err) {
+                console.error("anu-b-gone: " + err);
+                reveal();
+            });
         return true;
     }
 
